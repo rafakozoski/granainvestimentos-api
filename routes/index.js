@@ -16,30 +16,30 @@ router.get('/health', (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// HOMEPAGE — dados agregados + maiores altas/baixas
+// HOMEPAGE
 // GET /api/home
+// Plano free BRAPI: 1 ticker por req — buscamos 8 em paralelo
+// Com cache 30min: apenas 8 req por meio hora = ~11.520/mês
 // ─────────────────────────────────────────────
 router.get('/home', async (req, res) => {
   try {
-    const allFeatured = [
-      'BBAS3','PETR4','VALE3','ITUB4','WEGE3','MGLU3','RENT3','RDOR3',
-      'ABEV3','JBSS3','SUZB3','EMBR3','SBSP3','VIVT3','EGIE3','PRIO3'
-    ];
+    // 8 tickers para a homepage — cada um vira 1 requisição BRAPI
+    const featured = ['BBAS3','PETR4','VALE3','ITUB4','WEGE3','ABEV3','RENT3','RDOR3'];
 
-    const [quotes, marketNews] = await Promise.allSettled([
-      brapi.getQuote(allFeatured),
+    const [tickerResults, marketNews] = await Promise.allSettled([
+      brapi.getQuote(featured),
       news.getMarketNews(20),
     ]);
 
-    const tickers = quotes.status === 'fulfilled' ? quotes.value : [];
-    const sorted = [...tickers].sort((a,b) => b.changePercent - a.changePercent);
+    const tickers = tickerResults.status === 'fulfilled' ? tickerResults.value : [];
+    const sorted  = [...tickers].sort((a, b) => b.changePercent - a.changePercent);
 
     res.json({
-      tickers: tickers.slice(0, 8),
-      gainers: sorted.slice(0, 5),
-      losers: sorted.slice(-5).reverse(),
-      news: marketNews.status === 'fulfilled' ? marketNews.value : [],
-      updatedAt: new Date().toISOString(),
+      tickers,
+      gainers:    sorted.slice(0, 5),
+      losers:     sorted.slice(-5).reverse(),
+      news:       marketNews.status === 'fulfilled' ? marketNews.value : [],
+      updatedAt:  new Date().toISOString(),
     });
   } catch (err) {
     console.error('[Route /home]', err.message);
@@ -56,7 +56,6 @@ router.get('/quote/:tickers', async (req, res) => {
   const { tickers } = req.params;
   const tickerList = tickers.toUpperCase().split(',').slice(0, 20);
 
-  // Criptos têm formato diferente (BTC-USD), permite hífen
   const invalid = tickerList.filter(t => !/^[A-Z0-9]{2,6}(-[A-Z]{2,4})?$/.test(t));
   if (invalid.length) {
     return res.status(400).json({ error: `Ticker(s) inválido(s): ${invalid.join(', ')}` });
@@ -77,7 +76,7 @@ router.get('/quote/:tickers', async (req, res) => {
 // ─────────────────────────────────────────────
 router.get('/history/:ticker', async (req, res) => {
   const ticker = req.params.ticker.toUpperCase();
-  const range = req.query.range || '1mo';
+  const range    = req.query.range    || '1mo';
   const interval = req.query.interval || '1d';
 
   try {
@@ -109,7 +108,7 @@ router.get('/dividends/:ticker', async (req, res) => {
 // ─────────────────────────────────────────────
 router.get('/news/:ticker', async (req, res) => {
   const ticker = req.params.ticker.toUpperCase();
-  const limit = Math.min(parseInt(req.query.limit) || 10, 30);
+  const limit  = Math.min(parseInt(req.query.limit) || 10, 30);
   try {
     const articles = await news.getNewsByTicker(ticker, limit);
     res.json({ ticker, news: articles, count: articles.length });
@@ -141,19 +140,14 @@ router.get('/fundamentus/:ticker', async (req, res) => {
   try {
     const [fund, quoteResult] = await Promise.allSettled([
       getFundamentus(ticker),
-      brapi.getQuote([ticker]),
+      brapi.getOneTicker(ticker),
     ]);
 
-    const fundData = fund.status === 'fulfilled' ? fund.value : {};
-    const quote = quoteResult.status === 'fulfilled' ? quoteResult.value?.[0] : null;
+    const fundData     = fund.status === 'fulfilled' ? fund.value : {};
+    const quote        = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
     const precosJustos = calcPrecoJusto(quote, fundData);
 
-    res.json({
-      ticker,
-      fundamentus: fundData,
-      precosJustos,
-      updatedAt: new Date().toISOString(),
-    });
+    res.json({ ticker, fundamentus: fundData, precosJustos, updatedAt: new Date().toISOString() });
   } catch (err) {
     console.error(`[Route /fundamentus/${ticker}]`, err.message);
     res.status(502).json({ error: 'Erro ao buscar dados do Fundamentus' });
@@ -166,31 +160,31 @@ router.get('/fundamentus/:ticker', async (req, res) => {
 // ─────────────────────────────────────────────
 router.get('/ticker/:ticker', async (req, res) => {
   const ticker = req.params.ticker.toUpperCase();
-  const meta = findTicker(ticker);
+  const meta   = findTicker(ticker);
 
   try {
     const [quoteResult, newsResult, dividendsResult, fundResult] = await Promise.allSettled([
-      brapi.getQuote([ticker]),
+      brapi.getOneTicker(ticker),
       news.getNewsByTicker(ticker, 12),
       brapi.getDividends(ticker),
       getFundamentus(ticker),
     ]);
 
-    const quote = quoteResult.status === 'fulfilled' ? quoteResult.value?.[0] : null;
+    const quote = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
     if (!quote) return res.status(404).json({ error: `Ticker ${ticker} não encontrado` });
 
-    const fundData = fundResult.status === 'fulfilled' ? fundResult.value : {};
+    const fundData     = fundResult.status === 'fulfilled' ? fundResult.value : {};
     const precosJustos = calcPrecoJusto(quote, fundData);
 
     res.json({
       ticker,
-      meta: meta || { code: ticker, name: quote.name },
+      meta:          meta || { code: ticker, name: quote.name },
       quote,
-      fundamentus: fundData,
+      fundamentus:   fundData,
       precosJustos,
-      news: newsResult.status === 'fulfilled' ? newsResult.value : [],
-      dividends: dividendsResult.status === 'fulfilled' ? dividendsResult.value : [],
-      updatedAt: new Date().toISOString(),
+      news:          newsResult.status === 'fulfilled' ? newsResult.value : [],
+      dividends:     dividendsResult.status === 'fulfilled' ? dividendsResult.value : [],
+      updatedAt:     new Date().toISOString(),
     });
   } catch (err) {
     console.error(`[Route /ticker/${ticker}]`, err.message);
@@ -217,7 +211,7 @@ router.get('/tickers', (req, res) => {
   const { sector, type } = req.query;
   let list = TICKERS;
   if (sector) list = list.filter(t => t.sector === sector);
-  if (type) list = list.filter(t => t.type === type);
+  if (type)   list = list.filter(t => t.type   === type);
   res.json({ tickers: list, count: list.length });
 });
 

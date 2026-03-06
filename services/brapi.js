@@ -1,200 +1,138 @@
-// services/brapi.js — cotações e fundamentalistas via BRAPI
-// Documentação: https://brapi.dev/docs
+// services/brapi.js — cotações via BRAPI (plano gratuito: 1 ticker por req)
+// Estratégia: cache longo (30min cotação, 24h fundamentals) + 1 req/ticker
+// 15.000 req/mês = ~500/dia = suficiente para ~30 tickers únicos com refresh 30min
 
 const fetch = require('node-fetch');
-const { get, set, TTL } = require('../cache');
+const { get, set } = require('../cache');
 
 const BASE_URL = 'https://brapi.dev/api';
 
-// Campos fundamentalistas que a BRAPI retorna
-const FUNDAMENTAL_FIELDS = [
-'longName',
-'shortName',
-'regularMarketPrice',
-'regularMarketChange',
-'regularMarketChangePercent',
-'regularMarketDayHigh',
-'regularMarketDayLow',
-'regularMarketVolume',
-'regularMarketOpen',
-'regularMarketPreviousClose',
-'fiftyTwoWeekLow',
-'fiftyTwoWeekHigh',
-'marketCap',
-'sharesOutstanding',
-'priceEarnings',
-'earningsPerShare',
-'dividendYield'
-].join(',');
+const TTL = {
+  QUOTE:      30 * 60,       // 30 min — cotação
+  HISTORY:    60 * 60,       // 1h — histórico diário
+  HISTORY_5D: 15 * 60,       // 15min — intraday
+  DIVIDENDS:  24 * 60 * 60,  // 24h — dividendos
+};
 
-/**
- * Busca cotação e indicadores de um ou mais tickers
- * @param {string|string[]} tickers - ex: 'BBAS3' ou ['BBAS3','PETR4']
- */
-async function getQuote(tickers) {
-  const tickerList = Array.isArray(tickers) ? tickers.join(',') : tickers;
-  const cacheKey = `quote:${tickerList}`;
-
-  const cached = get(cacheKey);
-  if (cached) return cached;
-
+// Fetch simples com retry
+async function brapiGet(path, retries) {
+  retries = retries || 1;
   const token = process.env.BRAPI_TOKEN;
+  if (!token) throw new Error('BRAPI_TOKEN não configurado no Railway');
 
-  const url = `${BASE_URL}/quote/${tickerList}?token=${token}&fundamental=true`;
+  const sep = path.includes('?') ? '&' : '?';
+  const url = BASE_URL + path + sep + 'token=' + token;
 
-  try {
-    const res = await fetch(url, { timeout: 8000 });
-    if (!res.ok) throw new Error(`BRAPI HTTP ${res.status}`);
-
-    const data = await res.json();
-
-    if (!data.results || !data.results.length) {
-      throw new Error('Nenhum resultado retornado pela BRAPI');
+  for (var attempt = 0; attempt <= retries; attempt++) {
+    try {
+      var res = await fetch(url, { timeout: 10000 });
+      if (res.status === 429) throw new Error('BRAPI rate limit atingido');
+      if (!res.ok) throw new Error('BRAPI HTTP ' + res.status);
+      return await res.json();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      await new Promise(function(r){ setTimeout(r, 600 * (attempt + 1)); });
     }
-
-    // Normaliza os dados para o formato do front-end
-    const normalized = data.results.map(normalizeQuote);
-
-    set(cacheKey, normalized, TTL.QUOTE);
-    return normalized;
-
-  } catch (err) {
-    console.error(`[BRAPI] Erro ao buscar ${tickerList}:`, err.message);
-    throw err;
   }
 }
 
-/**
- * Busca histórico de preços para o gráfico
- * @param {string} ticker
- * @param {string} range - '1d','5d','1mo','3mo','6mo','1y','2y','5y','10y','ytd','max'
- * @param {string} interval - '1m','2m','5m','15m','30m','60m','90m','1h','1d','5d','1wk','1mo','3mo'
- */
-async function getHistory(ticker, range = '1mo', interval = '1d') {
-  const cacheKey = `history:${ticker}:${range}:${interval}`;
-
-  const cached = get(cacheKey);
-  if (cached) return cached;
-
-  const token = process.env.BRAPI_TOKEN;
-  const url = `${BASE_URL}/quote/${ticker}?token=${token}&range=${range}&interval=${interval}&history=true`;
-
-  try {
-    const res = await fetch(url, { timeout: 8000 });
-    if (!res.ok) throw new Error(`BRAPI HTTP ${res.status}`);
-
-    const data = await res.json();
-    const history = data.results?.[0]?.historicalDataPrice || [];
-
-    // TTL menor para histórico intraday
-    const ttl = range === '1d' ? 5 * 60 : 30 * 60;
-    set(cacheKey, history, ttl);
-
-    return history;
-
-  } catch (err) {
-    console.error(`[BRAPI] Erro ao buscar histórico de ${ticker}:`, err.message);
-    throw err;
-  }
-}
-
-/**
- * Busca dividendos de um ticker
- */
-async function getDividends(ticker) {
-  const cacheKey = `dividends:${ticker}`;
-
-  const cached = get(cacheKey);
-  if (cached) return cached;
-
-  const token = process.env.BRAPI_TOKEN;
-  const url = `${BASE_URL}/quote/${ticker}?token=${token}&dividends=true`;
-
-  try {
-    const res = await fetch(url, { timeout: 8000 });
-    if (!res.ok) throw new Error(`BRAPI HTTP ${res.status}`);
-
-    const data = await res.json();
-    const dividends = data.results?.[0]?.dividendsData?.cashDividends || [];
-
-    set(cacheKey, dividends, TTL.FUNDAMENTALS);
-    return dividends;
-
-  } catch (err) {
-    console.error(`[BRAPI] Erro ao buscar dividendos de ${ticker}:`, err.message);
-    throw err;
-  }
-}
-
-/**
- * Busca lista de todos os tickers disponíveis na B3
- */
-async function getAvailableTickers() {
-  const cacheKey = 'available_tickers';
-
-  const cached = get(cacheKey);
-  if (cached) return cached;
-
-  const token = process.env.BRAPI_TOKEN;
-  const url = `${BASE_URL}/available?token=${token}`;
-
-  try {
-    const res = await fetch(url, { timeout: 10000 });
-    if (!res.ok) throw new Error(`BRAPI HTTP ${res.status}`);
-
-    const data = await res.json();
-    const tickers = data.stocks || [];
-
-    set(cacheKey, tickers, TTL.TICKERS_LIST);
-    return tickers;
-
-  } catch (err) {
-    console.error('[BRAPI] Erro ao buscar lista de tickers:', err.message);
-    throw err;
-  }
-}
-
-/**
- * Normaliza os dados crus da BRAPI para o formato do front-end
- */
-function normalizeQuote(raw) {
+function normalize(raw) {
   return {
-    ticker: raw.symbol,
-    name: raw.longName || raw.shortName || raw.symbol,
-    shortName: raw.shortName,
-
-    // Preço
-    price: raw.regularMarketPrice || 0,
-    change: raw.regularMarketChange || 0,
-    changePercent: raw.regularMarketChangePercent || 0,
-    open: raw.regularMarketOpen || 0,
-    high: raw.regularMarketDayHigh || 0,
-    low: raw.regularMarketDayLow || 0,
-    previousClose: raw.regularMarketPreviousClose || 0,
-    volume: raw.regularMarketVolume || 0,
-
-    // 52 semanas
-    week52High: raw.fiftyTwoWeekHigh || 0,
-    week52Low: raw.fiftyTwoWeekLow || 0,
-
-    // Empresa
-    marketCap: raw.marketCap || 0,
-    sharesOutstanding: raw.sharesOutstanding || 0,
-
-    // Indicadores fundamentalistas
-    pl: raw.priceEarnings || null,
-    lpa: raw.earningsPerShare || null,
-    pvp: raw.priceToBook || null,
-    vpa: raw.bookValue || null,
-    dy: raw.dividendYield ? raw.dividendYield / 100 : null,
-    roe: raw.returnOnEquity || null,
-    roa: raw.returnOnAssets || null,
-    profitMargin: raw.profitMargins || null,
-
-    // Metadados
-    currency: raw.currency || 'BRL',
-    updatedAt: new Date().toISOString(),
+    ticker:        raw.symbol,
+    name:          raw.longName || raw.shortName || raw.symbol,
+    shortName:     raw.shortName || raw.symbol,
+    price:         raw.regularMarketPrice          || 0,
+    change:        raw.regularMarketChange         || 0,
+    changePercent: raw.regularMarketChangePercent  || 0,
+    open:          raw.regularMarketOpen           || 0,
+    high:          raw.regularMarketDayHigh        || 0,
+    low:           raw.regularMarketDayLow         || 0,
+    previousClose: raw.regularMarketPreviousClose  || 0,
+    volume:        raw.regularMarketVolume         || 0,
+    week52High:    raw.fiftyTwoWeekHigh            || 0,
+    week52Low:     raw.fiftyTwoWeekLow             || 0,
+    marketCap:     raw.marketCap                   || 0,
+    sharesOutstanding: raw.sharesOutstanding       || 0,
+    pl:            raw.priceEarnings    != null ? raw.priceEarnings    : null,
+    lpa:           raw.earningsPerShare != null ? raw.earningsPerShare : null,
+    pvp:           raw.priceToBook      != null ? raw.priceToBook      : null,
+    vpa:           raw.bookValue        != null ? raw.bookValue        : null,
+    dy:            raw.dividendYield    != null ? raw.dividendYield / 100 : null,
+    roe:           raw.returnOnEquity   != null ? raw.returnOnEquity   : null,
+    roa:           raw.returnOnAssets   != null ? raw.returnOnAssets   : null,
+    profitMargin:  raw.profitMargins    != null ? raw.profitMargins    : null,
+    currency:      raw.currency || 'BRL',
+    updatedAt:     new Date().toISOString(),
   };
 }
 
-module.exports = { getQuote, getHistory, getDividends, getAvailableTickers };
+// 1 ticker por requisição — respeita plano free
+async function getOneTicker(ticker) {
+  var key = 'q1:' + ticker;
+  var cached = get(key);
+  if (cached) return cached;
+
+  var data = await brapiGet('/quote/' + ticker + '?fundamental=true');
+  var result = data.results && data.results[0];
+  if (!result) throw new Error('Ticker ' + ticker + ' não encontrado');
+
+  var normalized = normalize(result);
+  set(key, normalized, TTL.QUOTE);
+  return normalized;
+}
+
+// Múltiplos tickers: 1 req cada, paralelo com limite de 8 simultâneos
+async function getQuote(tickers) {
+  var list = Array.isArray(tickers)
+    ? tickers
+    : String(tickers).split(',').map(function(t){ return t.trim().toUpperCase(); });
+
+  var CONCURRENCY = 8;
+  var results = [];
+
+  for (var i = 0; i < list.length; i += CONCURRENCY) {
+    var chunk = list.slice(i, i + CONCURRENCY);
+    var settled = await Promise.allSettled(chunk.map(function(t){ return getOneTicker(t); }));
+    settled.forEach(function(r){ if (r.status === 'fulfilled') results.push(r.value); });
+  }
+
+  return results;
+}
+
+async function getHistory(ticker, range, interval) {
+  range = range || '1mo';
+  interval = interval || '1d';
+  var key = 'hist:' + ticker + ':' + range + ':' + interval;
+  var cached = get(key);
+  if (cached) return cached;
+
+  var data = await brapiGet('/quote/' + ticker + '?range=' + range + '&interval=' + interval + '&history=true');
+  var history = (data.results && data.results[0] && data.results[0].historicalDataPrice) || [];
+  var ttl = (range === '1d' || range === '5d') ? TTL.HISTORY_5D : TTL.HISTORY;
+  set(key, history, ttl);
+  return history;
+}
+
+async function getDividends(ticker) {
+  var key = 'div:' + ticker;
+  var cached = get(key);
+  if (cached) return cached;
+
+  var data = await brapiGet('/quote/' + ticker + '?dividends=true');
+  var dividends = (data.results && data.results[0] && data.results[0].dividendsData && data.results[0].dividendsData.cashDividends) || [];
+  set(key, dividends, TTL.DIVIDENDS);
+  return dividends;
+}
+
+async function getAvailableTickers() {
+  var key = 'avail';
+  var cached = get(key);
+  if (cached) return cached;
+
+  var data = await brapiGet('/available');
+  var tickers = data.stocks || [];
+  set(key, tickers, 24 * 60 * 60);
+  return tickers;
+}
+
+module.exports = { getQuote, getOneTicker, getHistory, getDividends, getAvailableTickers };
