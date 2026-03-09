@@ -7,6 +7,7 @@ const news = require('../services/news');
 const { getFundamentus, calcPrecoJusto } = require('../services/fundamentus');
 const { FEATURED_TICKERS, searchTickers, findTicker, TICKERS } = require('../data/tickers');
 const { stats } = require('../cache');
+const { getDocumentsByCnpj } = require('../services/cvm');
 
 // ─────────────────────────────────────────────
 // HEALTH CHECK
@@ -222,6 +223,66 @@ router.get('/tickers', (req, res) => {
 router.get('/sectors', (req, res) => {
   const sectors = [...new Set(TICKERS.map(t => t.sector))].sort();
   res.json({ sectors });
+});
+
+// ─────────────────────────────────────────────
+// RELATÓRIOS RI — Dados Abertos CVM
+// GET /api/ri/:ticker
+//
+// Retorna documentos oficiais (DFP, ITR, FRE, FCA, IPE)
+// para ativos com CNPJ cadastrado (ações e FIIs).
+// ETFs, BDRs e Criptos recebem available:false.
+//
+// Resposta:
+// {
+//   available: true,
+//   ticker: "BBAS3",
+//   cnpj: "00.000.000/0001-91",
+//   docs: [ { tipo, descricao, periodo, versao, link, linkEnet } ],
+//   enetLinks: [ { label, descricao, link } ]   ← sempre presentes se CNPJ existir
+// }
+// ─────────────────────────────────────────────
+router.get('/ri/:ticker', async (req, res) => {
+  const ticker = req.params.ticker.toUpperCase();
+  const meta   = findTicker(ticker);
+
+  // Tipos sem CNPJ (ETF, BDR, Cripto) — retorna links genéricos da CVM
+  if (!meta || !meta.cnpj) {
+    return res.json({
+      available: false,
+      ticker,
+      reason: meta ? 'sem_cnpj' : 'ticker_nao_encontrado',
+      message: meta
+        ? `${meta.type?.toUpperCase() || 'Ativo'} não publica documentos na CVM`
+        : 'Ticker não encontrado na base de dados',
+      enetLinks: [
+        {
+          label:     'Buscar RI da empresa',
+          descricao: 'Pesquisa no Google para Relações com Investidores',
+          link:      `https://www.google.com/search?q=${encodeURIComponent(ticker + ' relacoes com investidores RI site:ri.')}`,
+        },
+        {
+          label:     'Portal ENET CVM',
+          descricao: 'Consulta geral de documentos',
+          link:      'https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx',
+        },
+        {
+          label:     'Dados Abertos CVM',
+          descricao: 'Datasets estruturados em CSV',
+          link:      'https://dados.cvm.gov.br',
+        },
+      ],
+    });
+  }
+
+  try {
+    const data = await getDocumentsByCnpj(ticker, meta.cnpj);
+    res.set('Cache-Control', 'public, max-age=21600'); // 6h no browser/CDN
+    res.json(data);
+  } catch (err) {
+    console.error(`[Route /ri/${ticker}]`, err.message);
+    res.status(500).json({ error: 'Erro ao buscar documentos na CVM', ticker });
+  }
 });
 
 module.exports = router;
