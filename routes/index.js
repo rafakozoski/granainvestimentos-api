@@ -25,7 +25,7 @@ router.get('/health', (req, res) => {
 router.get('/home', async (req, res) => {
   try {
     // 8 tickers para a homepage — cada um vira 1 requisição BRAPI
-    const featured = ['BBAS3','PETR4','VALE3','ITUB4','WEGE3','ABEV3','RENT3','RDOR3'];
+    const featured = ['BOVA11','BBAS3','PETR4','VALE3','ITUB4','WEGE3','ABEV3','RENT3'];
 
     const [tickerResults, marketNews] = await Promise.allSettled([
       brapi.getQuote(featured),
