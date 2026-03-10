@@ -29,15 +29,23 @@ router.get('/macro', async (req, res) => {
   const cached = cacheGet('macro:all');
   if (cached) return res.json(cached);
 
+  const TOKEN = process.env.BRAPI_TOKEN ? '&token=' + process.env.BRAPI_TOKEN : '';
+
   try {
-    // Cotações via BRAPI (^BVSP, ^GSPC, BTC-USD, GC=F, USD-BRL via currency)
-    const [quotesRes, currencyRes, selicRes, ipcaRes] = await Promise.allSettled([
+    // ── 1. Cotações BRAPI: Ibovespa, S&P500, BTC, Ouro ──────────────────────
+    const [quotesRes, usdRes, selicRes, ipcaRes] = await Promise.allSettled([
       brapi.getQuote(['^BVSP', '^GSPC', 'BTC-USD', 'GC=F']),
-      fetch('https://brapi.dev/api/v2/currency?currency=USD-BRL' + (process.env.BRAPI_TOKEN ? '&token=' + process.env.BRAPI_TOKEN : ''))
+
+      // USD/BRL — AwesomeAPI (sem token, sempre gratuita)
+      fetch('https://economia.awesomeapi.com.br/last/USD-BRL', { timeout: 6000 })
         .then(r => r.json()),
-      fetch('https://brapi.dev/api/v2/prime-rate?country=brazil&sortBy=date&sortOrder=desc' + (process.env.BRAPI_TOKEN ? '&token=' + process.env.BRAPI_TOKEN : ''))
+
+      // Selic — Banco Central (API aberta, sem token)
+      fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json', { timeout: 6000 })
         .then(r => r.json()),
-      fetch('https://brapi.dev/api/v2/inflation?country=brazil&sortBy=date&sortOrder=desc&limit=12' + (process.env.BRAPI_TOKEN ? '&token=' + process.env.BRAPI_TOKEN : ''))
+
+      // IPCA 12m — Banco Central (série 13522 = IPCA acum. 12m)
+      fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.13522/dados/ultimos/1?formato=json', { timeout: 6000 })
         .then(r => r.json()),
     ]);
 
@@ -46,38 +54,60 @@ router.get('/macro', async (req, res) => {
     const byTk   = {};
     quotes.forEach(function(q){ byTk[q.ticker] = q; });
 
-    // USD/BRL
+    // ── USD/BRL via AwesomeAPI ───────────────────────────────────────────────
     let usd = null;
-    if (currencyRes.status === 'fulfilled' && currencyRes.value.currency && currencyRes.value.currency[0]) {
-      usd = parseFloat(currencyRes.value.currency[0].ask || currencyRes.value.currency[0].bidPrice);
+    if (usdRes.status === 'fulfilled') {
+      try {
+        const d = usdRes.value;
+        const row = d.USDBRL || d['USD-BRL'] || Object.values(d)[0];
+        if (row) {
+          usd = parseFloat(row.ask || row.bid || row.high);
+        }
+      } catch(e) { console.warn('[macro] USD parse error:', e.message); }
+    } else {
+      console.warn('[macro] USD fetch failed:', usdRes.reason?.message);
     }
 
-    // Selic
+    // ── Selic via BCB ────────────────────────────────────────────────────────
+    // Série 432 = Taxa Selic (% a.a.)
     let selic = null;
-    if (selicRes.status === 'fulfilled' && selicRes.value.prime_rate && selicRes.value.prime_rate[0]) {
-      selic = parseFloat(selicRes.value.prime_rate[0].value);
+    if (selicRes.status === 'fulfilled') {
+      try {
+        const arr = selicRes.value;
+        if (Array.isArray(arr) && arr[0]) {
+          selic = parseFloat(arr[0].valor);
+        }
+      } catch(e) { console.warn('[macro] Selic parse error:', e.message); }
+    } else {
+      console.warn('[macro] Selic fetch failed:', selicRes.reason?.message);
     }
 
-    // IPCA acumulado 12m
+    // ── IPCA 12m via BCB ─────────────────────────────────────────────────────
+    // Série 13522 = IPCA acumulado 12 meses (já vem calculado pelo BCB)
     let ipca = null;
-    if (ipcaRes.status === 'fulfilled' && ipcaRes.value.inflation && ipcaRes.value.inflation.length) {
-      ipca = ipcaRes.value.inflation
-        .slice(0, 12)
-        .reduce((sum, x) => sum + parseFloat(x.value || 0), 0);
-      ipca = parseFloat(ipca.toFixed(2));
+    if (ipcaRes.status === 'fulfilled') {
+      try {
+        const arr = ipcaRes.value;
+        if (Array.isArray(arr) && arr[0]) {
+          ipca = parseFloat(parseFloat(arr[0].valor).toFixed(2));
+        }
+      } catch(e) { console.warn('[macro] IPCA parse error:', e.message); }
+    } else {
+      console.warn('[macro] IPCA fetch failed:', ipcaRes.reason?.message);
     }
 
     const macro = {
-      ibov:  byTk['^BVSP']  || null,
-      spx:   byTk['^GSPC']  || null,
-      btc:   byTk['BTC-USD']|| null,
-      ouro:  byTk['GC=F']   || null,
+      ibov:  byTk['^BVSP']   || null,
+      spx:   byTk['^GSPC']   || null,
+      btc:   byTk['BTC-USD'] || null,
+      ouro:  byTk['GC=F']    || null,
       usd,
       selic,
       ipca,
       updatedAt: new Date().toISOString(),
     };
 
+    console.log('[macro] usd=%s selic=%s ipca=%s', usd, selic, ipca);
     cacheSet('macro:all', macro, 30 * 60); // 30 min
     res.json(macro);
   } catch (err) {
