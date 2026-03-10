@@ -32,9 +32,13 @@ app.use('/api', limiter);
 const allowedOrigins = [
   'https://granainvestimentos.com.br',
   'https://www.granainvestimentos.com.br',
+  'http://granainvestimentos.com.br',
+  'http://www.granainvestimentos.com.br',
   'https://mercado.granainvestimentos.com.br',
   'https://analitica.granainvestimentos.com.br',
   'https://radar.granainvestimentos.com.br',
+  'https://startgrana.com.br',
+  'https://www.startgrana.com.br',
   // desenvolvimento local
   'http://localhost:3000',
   'http://localhost:5500',
