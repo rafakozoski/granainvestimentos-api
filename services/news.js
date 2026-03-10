@@ -80,6 +80,7 @@ const parser = new Parser({
       ['media:thumbnail', 'thumbnail'],
       ['enclosure', 'enclosure'],
       ['content:encoded', 'content:encoded'],
+      ['description', 'description'],
     ],
   },
 });
@@ -146,12 +147,33 @@ function strHash(str) {
 
 // Retorna a URL de fallback correta para o setor/tipo, variando pela notícia
 function getFallbackImage(sector, type, title) {
-  const pool =
-    (type && type !== 'acao' && IMAGE_BANK[type])
-      ? IMAGE_BANK[type]
-      : (sector && IMAGE_BANK[sector])
-        ? IMAGE_BANK[sector]
-        : IMAGE_BANK.mercado;
+  // Tenta match direto por tipo/setor
+  let pool = null;
+
+  if (type && type !== 'acao' && IMAGE_BANK[type]) {
+    pool = IMAGE_BANK[type];
+  } else if (sector && IMAGE_BANK[sector]) {
+    pool = IMAGE_BANK[sector];
+  }
+
+  // Se não achou por setor/tipo, tenta palavras-chave no título
+  if (!pool && title) {
+    const t = title.toLowerCase();
+    if (/bitcoin|btc|ethereum|eth|cripto|crypto/.test(t))      pool = IMAGE_BANK.cripto;
+    else if (/petrobras|petr|petroleo|petróleo|oil|gas/.test(t)) pool = IMAGE_BANK['Petróleo'];
+    else if (/vale|mineração|mineracao|minério|minero/.test(t))  pool = IMAGE_BANK['Mineração'];
+    else if (/banco|itau|bradesco|financ/.test(t))               pool = IMAGE_BANK.Bancos;
+    else if (/fii|fundo imobiliário|imobiliario|cri|lci/.test(t)) pool = IMAGE_BANK.fii;
+    else if (/etf|bova11|ivvb|selic|tesouro/.test(t))           pool = IMAGE_BANK.etf;
+    else if (/bdr|aapl|apple|microsoft|amazon|google/.test(t))  pool = IMAGE_BANK.bdr;
+    else if (/energia|eletrica|enel|cemig|copel/.test(t))       pool = IMAGE_BANK.Energia;
+    else if (/agro|soja|milho|boi|cana|farm/.test(t))           pool = IMAGE_BANK['Agronegócio'];
+    else if (/saude|hospital|fleury|dasa|hapvida/.test(t))       pool = IMAGE_BANK['Saúde'];
+    else if (/varejo|lojas|magazine|renner|via/.test(t))        pool = IMAGE_BANK.Varejo;
+    else if (/tecnologia|tech|software|totvs/.test(t))          pool = IMAGE_BANK.Tecnologia;
+  }
+
+  if (!pool) pool = IMAGE_BANK.mercado;
 
   const idx = strHash(title || '') % pool.length;
   return pool[idx];
@@ -165,22 +187,23 @@ function getFallbackImage(sector, type, title) {
 //   3. Banco de imagens Unsplash por categoria (fallback final)
 // ─────────────────────────────────────────────
 async function enrichImages(items, sector, type) {
-  const withoutImage = items.filter(i => !i.image);
-  if (!withoutImage.length) return items;
+  // Camada 2: og:image scraping — só para itens sem imagem e com URL real
+  const withoutImage = items.filter(i => !i.image && i.url && i.url !== '#');
 
-  // Camada 2: og:image scraping
-  const CHUNK = 8;
-  for (let i = 0; i < withoutImage.length; i += CHUNK) {
-    const chunk = withoutImage.slice(i, i + CHUNK);
-    await Promise.allSettled(
-      chunk.map(async (item) => {
-        const img = await fetchOgImage(item.url);
-        if (img) item.image = img;
-      })
-    );
+  if (withoutImage.length > 0) {
+    const CHUNK = 6;
+    for (let i = 0; i < withoutImage.length; i += CHUNK) {
+      const chunk = withoutImage.slice(i, i + CHUNK);
+      await Promise.allSettled(
+        chunk.map(async (item) => {
+          const img = await fetchOgImage(item.url);
+          if (img) item.image = img;
+        })
+      );
+    }
   }
 
-  // Camada 3: fallback Hostinger para quem ainda não tem imagem
+  // Camada 3: fallback inteligente — usa palavras-chave do título para variar imagem
   items.forEach(function(item) {
     if (!item.image) {
       item.image = getFallbackImage(sector, type, item.title);
@@ -320,17 +343,22 @@ function normalizeNewsItem(item, sourceFallback) {
   excerpt = excerpt.replace(/<[^>]*>/g, '').trim().slice(0, 220);
   if (excerpt.length === 220) excerpt += '…';
 
-  // Tenta extrair imagem (múltiplas estratégias)
+  // Extrai imagem — várias estratégias em ordem de confiabilidade
   let image = null;
-  if (item.enclosure?.url)   image = item.enclosure.url;
-  else if (item['media:content']?.$.url) image = item['media:content'].$.url;
-  else if (item.media?.url)  image = item.media.url;
-  else if (item.thumbnail?.url) image = item.thumbnail.url;
 
-  // Tenta extrair do conteúdo HTML (Google News embute <img> no content)
+  // 1. enclosure (RSS padrão)
+  if (item.enclosure?.url) image = item.enclosure.url;
+
+  // 2. media:content
+  if (!image && item['media:content']?.$.url) image = item['media:content'].$.url;
+  if (!image && item.media?.url) image = item.media.url;
+  if (!image && item.thumbnail?.url) image = item.thumbnail.url;
+
+  // 3. Google News embute thumbnail no campo "description" como <img src="...">
+  //    Ex: <img src="https://lh3.googleusercontent.com/..." />
   if (!image) {
-    const rawContent = item.content || item['content:encoded'] || item.summary || '';
-    const imgMatch = rawContent.match(/<img[^>]+src=["']([^"']+)["']/i);
+    const rawDesc = item.description || item.content || item['content:encoded'] || item.summary || '';
+    const imgMatch = rawDesc.match(/<img[^>]+src=["']([^"']+)["']/i);
     if (imgMatch && imgMatch[1] && !imgMatch[1].startsWith('data:')) {
       image = imgMatch[1];
     }
