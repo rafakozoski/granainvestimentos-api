@@ -18,6 +18,74 @@ router.get('/health', (req, res) => {
 
 // ─────────────────────────────────────────────
 // HOMEPAGE
+// GET /api/macro
+// Ibovespa (^BVSP), SPX (^GSPC), USD/BRL, BTC-USD, Ouro (GC=F), Selic, IPCA
+// Cache 30min para cotações, 24h para Selic/IPCA
+// ─────────────────────────────────────────────
+const { get: cacheGet, set: cacheSet } = require('../cache');
+const fetch = require('node-fetch');
+
+router.get('/macro', async (req, res) => {
+  const cached = cacheGet('macro:all');
+  if (cached) return res.json(cached);
+
+  try {
+    // Cotações via BRAPI (^BVSP, ^GSPC, BTC-USD, GC=F, USD-BRL via currency)
+    const [quotesRes, currencyRes, selicRes, ipcaRes] = await Promise.allSettled([
+      brapi.getQuote(['^BVSP', '^GSPC', 'BTC-USD', 'GC=F']),
+      fetch('https://brapi.dev/api/v2/currency?currency=USD-BRL' + (process.env.BRAPI_TOKEN ? '&token=' + process.env.BRAPI_TOKEN : ''))
+        .then(r => r.json()),
+      fetch('https://brapi.dev/api/v2/prime-rate?country=brazil&sortBy=date&sortOrder=desc' + (process.env.BRAPI_TOKEN ? '&token=' + process.env.BRAPI_TOKEN : ''))
+        .then(r => r.json()),
+      fetch('https://brapi.dev/api/v2/inflation?country=brazil&sortBy=date&sortOrder=desc&limit=12' + (process.env.BRAPI_TOKEN ? '&token=' + process.env.BRAPI_TOKEN : ''))
+        .then(r => r.json()),
+    ]);
+
+    // Cotações
+    const quotes = quotesRes.status === 'fulfilled' ? quotesRes.value : [];
+    const byTk   = {};
+    quotes.forEach(function(q){ byTk[q.ticker] = q; });
+
+    // USD/BRL
+    let usd = null;
+    if (currencyRes.status === 'fulfilled' && currencyRes.value.currency && currencyRes.value.currency[0]) {
+      usd = parseFloat(currencyRes.value.currency[0].ask || currencyRes.value.currency[0].bidPrice);
+    }
+
+    // Selic
+    let selic = null;
+    if (selicRes.status === 'fulfilled' && selicRes.value.prime_rate && selicRes.value.prime_rate[0]) {
+      selic = parseFloat(selicRes.value.prime_rate[0].value);
+    }
+
+    // IPCA acumulado 12m
+    let ipca = null;
+    if (ipcaRes.status === 'fulfilled' && ipcaRes.value.inflation && ipcaRes.value.inflation.length) {
+      ipca = ipcaRes.value.inflation
+        .slice(0, 12)
+        .reduce((sum, x) => sum + parseFloat(x.value || 0), 0);
+      ipca = parseFloat(ipca.toFixed(2));
+    }
+
+    const macro = {
+      ibov:  byTk['^BVSP']  || null,
+      spx:   byTk['^GSPC']  || null,
+      btc:   byTk['BTC-USD']|| null,
+      ouro:  byTk['GC=F']   || null,
+      usd,
+      selic,
+      ipca,
+      updatedAt: new Date().toISOString(),
+    };
+
+    cacheSet('macro:all', macro, 30 * 60); // 30 min
+    res.json(macro);
+  } catch (err) {
+    console.error('[Route /macro]', err.message);
+    res.status(500).json({ error: 'Erro ao carregar indices macro' });
+  }
+});
+
 // GET /api/home
 // Plano free BRAPI: 1 ticker por req — buscamos 8 em paralelo
 // Com cache 30min: apenas 8 req por meio hora = ~11.520/mês
