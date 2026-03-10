@@ -101,44 +101,60 @@ const RSS_SOURCES = {
 
 // ─────────────────────────────────────────────
 // Banco de imagens por categoria — hospedadas no Hostinger
+// 3 variações por categoria, selecionadas por hash do título da notícia
 // Pasta: granainvestimentos.com.br/mercado/assets/news/
 // ─────────────────────────────────────────────
 const NEWS_IMG_BASE = 'https://granainvestimentos.com.br/mercado/assets/news';
 
 const IMAGE_BANK = {
   // Por tipo de ativo
-  fii:    `${NEWS_IMG_BASE}/fii.jpg`,
-  etf:    `${NEWS_IMG_BASE}/etf.jpg`,
-  bdr:    `${NEWS_IMG_BASE}/bdr.jpg`,
-  cripto: `${NEWS_IMG_BASE}/cripto.jpg`,
+  fii:    [`${NEWS_IMG_BASE}/fii-1.jpg`,    `${NEWS_IMG_BASE}/fii-2.jpg`,    `${NEWS_IMG_BASE}/fii-3.jpg`],
+  etf:    [`${NEWS_IMG_BASE}/etf-1.jpg`,    `${NEWS_IMG_BASE}/etf-2.jpg`,    `${NEWS_IMG_BASE}/etf-3.jpg`],
+  bdr:    [`${NEWS_IMG_BASE}/bdr-1.jpg`,    `${NEWS_IMG_BASE}/bdr-2.jpg`,    `${NEWS_IMG_BASE}/bdr-3.jpg`],
+  cripto: [`${NEWS_IMG_BASE}/cripto-1.jpg`, `${NEWS_IMG_BASE}/cripto-2.jpg`, `${NEWS_IMG_BASE}/cripto-3.jpg`],
 
   // Por setor (ações)
-  Bancos:      `${NEWS_IMG_BASE}/bancos.jpg`,
-  Energia:     `${NEWS_IMG_BASE}/energia.jpg`,
-  'Petróleo':  `${NEWS_IMG_BASE}/petroleo.jpg`,
-  'Mineração': `${NEWS_IMG_BASE}/mineracao.jpg`,
-  Tecnologia:  `${NEWS_IMG_BASE}/tecnologia.jpg`,
-  Varejo:      `${NEWS_IMG_BASE}/varejo.jpg`,
-  Consumo:     `${NEWS_IMG_BASE}/consumo.jpg`,
-  'Saúde':     `${NEWS_IMG_BASE}/saude.jpg`,
-  'Imóveis':   `${NEWS_IMG_BASE}/imoveis.jpg`,
-  'Logística': `${NEWS_IMG_BASE}/logistica.jpg`,
-  Seguros:     `${NEWS_IMG_BASE}/seguros.jpg`,
-  Financeiro:  `${NEWS_IMG_BASE}/financeiro.jpg`,
-  'Agronegócio': `${NEWS_IMG_BASE}/agronegocio.jpg`,
-  'Educação':  `${NEWS_IMG_BASE}/educacao.jpg`,
-  Saneamento:  `${NEWS_IMG_BASE}/saneamento.jpg`,
-  Papel:       `${NEWS_IMG_BASE}/papel.jpg`,
+  Bancos:        [`${NEWS_IMG_BASE}/bancos-1.jpg`,      `${NEWS_IMG_BASE}/bancos-2.jpg`,      `${NEWS_IMG_BASE}/bancos-3.jpg`],
+  Energia:       [`${NEWS_IMG_BASE}/energia-1.jpg`,     `${NEWS_IMG_BASE}/energia-2.jpg`,     `${NEWS_IMG_BASE}/energia-3.jpg`],
+  'Petróleo':    [`${NEWS_IMG_BASE}/petroleo-1.jpg`,    `${NEWS_IMG_BASE}/petroleo-2.jpg`,    `${NEWS_IMG_BASE}/petroleo-3.jpg`],
+  'Mineração':   [`${NEWS_IMG_BASE}/mineracao-1.jpg`,   `${NEWS_IMG_BASE}/mineracao-2.jpg`,   `${NEWS_IMG_BASE}/mineracao-3.jpg`],
+  Tecnologia:    [`${NEWS_IMG_BASE}/tecnologia-1.jpg`,  `${NEWS_IMG_BASE}/tecnologia-2.jpg`,  `${NEWS_IMG_BASE}/tecnologia-3.jpg`],
+  Varejo:        [`${NEWS_IMG_BASE}/varejo-1.jpg`,      `${NEWS_IMG_BASE}/varejo-2.jpg`,      `${NEWS_IMG_BASE}/varejo-3.jpg`],
+  Consumo:       [`${NEWS_IMG_BASE}/consumo-1.jpg`,     `${NEWS_IMG_BASE}/consumo-2.jpg`,     `${NEWS_IMG_BASE}/consumo-3.jpg`],
+  'Saúde':       [`${NEWS_IMG_BASE}/saude-1.jpg`,       `${NEWS_IMG_BASE}/saude-2.jpg`,       `${NEWS_IMG_BASE}/saude-3.jpg`],
+  'Imóveis':     [`${NEWS_IMG_BASE}/imoveis-1.jpg`,     `${NEWS_IMG_BASE}/imoveis-2.jpg`,     `${NEWS_IMG_BASE}/imoveis-3.jpg`],
+  'Logística':   [`${NEWS_IMG_BASE}/logistica-1.jpg`,   `${NEWS_IMG_BASE}/logistica-2.jpg`,   `${NEWS_IMG_BASE}/logistica-3.jpg`],
+  Seguros:       [`${NEWS_IMG_BASE}/seguros-1.jpg`,     `${NEWS_IMG_BASE}/seguros-2.jpg`,     `${NEWS_IMG_BASE}/seguros-3.jpg`],
+  Financeiro:    [`${NEWS_IMG_BASE}/financeiro-1.jpg`,  `${NEWS_IMG_BASE}/financeiro-2.jpg`,  `${NEWS_IMG_BASE}/financeiro-3.jpg`],
+  'Agronegócio': [`${NEWS_IMG_BASE}/agronegocio-1.jpg`, `${NEWS_IMG_BASE}/agronegocio-2.jpg`, `${NEWS_IMG_BASE}/agronegocio-3.jpg`],
+  'Educação':    [`${NEWS_IMG_BASE}/educacao-1.jpg`,    `${NEWS_IMG_BASE}/educacao-2.jpg`,    `${NEWS_IMG_BASE}/educacao-3.jpg`],
+  Saneamento:    [`${NEWS_IMG_BASE}/saneamento-1.jpg`,  `${NEWS_IMG_BASE}/saneamento-2.jpg`,  `${NEWS_IMG_BASE}/saneamento-3.jpg`],
+  Papel:         [`${NEWS_IMG_BASE}/papel-1.jpg`,       `${NEWS_IMG_BASE}/papel-2.jpg`,       `${NEWS_IMG_BASE}/papel-3.jpg`],
 
   // Fallback geral
-  mercado:     `${NEWS_IMG_BASE}/mercado.jpg`,
+  mercado: [`${NEWS_IMG_BASE}/mercado-1.jpg`, `${NEWS_IMG_BASE}/mercado-2.jpg`, `${NEWS_IMG_BASE}/mercado-3.jpg`],
 };
 
-// Retorna a URL de fallback correta para o setor/tipo
-function getFallbackImage(sector, type) {
-  if (type && type !== 'acao' && IMAGE_BANK[type]) return IMAGE_BANK[type];
-  if (sector && IMAGE_BANK[sector]) return IMAGE_BANK[sector];
-  return IMAGE_BANK.mercado;
+// Hash simples do título para seleção determinística (mesma notícia = mesma imagem sempre)
+function strHash(str) {
+  let h = 0;
+  for (let i = 0; i < (str || '').length; i++) {
+    h = Math.imul(31, h) + str.charCodeAt(i) | 0;
+  }
+  return Math.abs(h);
+}
+
+// Retorna a URL de fallback correta para o setor/tipo, variando pela notícia
+function getFallbackImage(sector, type, title) {
+  const pool =
+    (type && type !== 'acao' && IMAGE_BANK[type])
+      ? IMAGE_BANK[type]
+      : (sector && IMAGE_BANK[sector])
+        ? IMAGE_BANK[sector]
+        : IMAGE_BANK.mercado;
+
+  const idx = strHash(title || '') % pool.length;
+  return pool[idx];
 }
 
 // ─────────────────────────────────────────────
@@ -167,7 +183,7 @@ async function enrichImages(items, sector, type) {
   // Camada 3: fallback Hostinger para quem ainda não tem imagem
   items.forEach(function(item) {
     if (!item.image) {
-      item.image = getFallbackImage(sector, type);
+      item.image = getFallbackImage(sector, type, item.title);
       item.imageFallback = true;
     }
   });
