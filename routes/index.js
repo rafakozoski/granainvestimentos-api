@@ -36,17 +36,47 @@ router.get('/macro', async (req, res) => {
     const [quotesRes, usdRes, selicRes, ipcaRes] = await Promise.allSettled([
       brapi.getQuote(['^BVSP', '^GSPC', 'BTC-USD', 'GC=F']),
 
-      // USD/BRL — AwesomeAPI (sem token, sempre gratuita)
-      fetch('https://economia.awesomeapi.com.br/last/USD-BRL', { timeout: 6000 })
-        .then(r => r.json()),
+      // USD/BRL — AwesomeAPI com fallback BCB
+      (async () => {
+        try {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 6000);
+          const r = await fetch('https://economia.awesomeapi.com.br/last/USD-BRL', { signal: ctrl.signal });
+          clearTimeout(t);
+          return await r.json();
+        } catch(e) { console.warn('[macro] AwesomeAPI USD erro:', e.message); }
+        try {
+          const ctrl2 = new AbortController();
+          const t2 = setTimeout(() => ctrl2.abort(), 6000);
+          const r2 = await fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados/ultimos/1?formato=json', { signal: ctrl2.signal });
+          clearTimeout(t2);
+          const d = await r2.json();
+          if (Array.isArray(d) && d[0]) return { USDBRL: { ask: String(d[0].valor).replace(',','.') } };
+        } catch(e2) { console.warn('[macro] BCB USD fallback erro:', e2.message); }
+        return null;
+      })(),
 
-      // Selic — Banco Central (API aberta, sem token)
-      fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json', { timeout: 6000 })
-        .then(r => r.json()),
+      // Selic — BCB série 432
+      (async () => {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 6000);
+        try {
+          const r = await fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json', { signal: ctrl.signal });
+          clearTimeout(t);
+          return await r.json();
+        } catch(e) { clearTimeout(t); return null; }
+      })(),
 
-      // IPCA 12m — Banco Central (série 13522 = IPCA acum. 12m)
-      fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.13522/dados/ultimos/1?formato=json', { timeout: 6000 })
-        .then(r => r.json()),
+      // IPCA 12m — BCB série 13522
+      (async () => {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 6000);
+        try {
+          const r = await fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.13522/dados/ultimos/1?formato=json', { signal: ctrl.signal });
+          clearTimeout(t);
+          return await r.json();
+        } catch(e) { clearTimeout(t); return null; }
+      })(),
     ]);
 
     // Cotações
