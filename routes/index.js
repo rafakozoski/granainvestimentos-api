@@ -36,46 +36,97 @@ router.get('/macro', async (req, res) => {
     const [quotesRes, usdRes, selicRes, ipcaRes] = await Promise.allSettled([
       brapi.getQuote(['^BVSP', '^GSPC', 'BTC-USD', 'GC=F']),
 
-      // USD/BRL — AwesomeAPI com fallback BCB
+      // USD/BRL — 3 fontes em cascata
       (async () => {
+        // Fonte 1: BCB cotações do dia (API olinda — retorna valor em tempo real)
+        try {
+          const hoje = new Date().toLocaleDateString('pt-BR').split('/').reverse().join('-'); // YYYY-MM-DD
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 7000);
+          const url = 'https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia(dataCotacao=@dataCotacao)?@dataCotacao=\''+hoje+'\''
+                    + '&$top=1&$orderby=dataHoraCotacao%20desc&$format=json&$select=cotacaoVenda';
+          const r = await fetch(url, { signal: ctrl.signal });
+          clearTimeout(t);
+          const d = await r.json();
+          const val = d && d.value && d.value[0] && d.value[0].cotacaoVenda;
+          if (val) return { USDBRL: { ask: String(val) } };
+        } catch(e) { console.warn('[macro] BCB PTAX erro:', e.message); }
+
+        // Fonte 2: AwesomeAPI
         try {
           const ctrl = new AbortController();
           const t = setTimeout(() => ctrl.abort(), 6000);
           const r = await fetch('https://economia.awesomeapi.com.br/last/USD-BRL', { signal: ctrl.signal });
           clearTimeout(t);
-          return await r.json();
+          const d = await r.json();
+          const row = d.USDBRL || d['USD-BRL'] || Object.values(d)[0];
+          if (row && (row.ask || row.bid)) return { USDBRL: { ask: row.ask || row.bid } };
         } catch(e) { console.warn('[macro] AwesomeAPI USD erro:', e.message); }
+
+        // Fonte 3: BRAPI (requer token)
         try {
-          const ctrl2 = new AbortController();
-          const t2 = setTimeout(() => ctrl2.abort(), 6000);
-          const r2 = await fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados/ultimos/1?formato=json', { signal: ctrl2.signal });
-          clearTimeout(t2);
-          const d = await r2.json();
-          if (Array.isArray(d) && d[0]) return { USDBRL: { ask: String(d[0].valor).replace(',','.') } };
-        } catch(e2) { console.warn('[macro] BCB USD fallback erro:', e2.message); }
+          const token = process.env.BRAPI_TOKEN;
+          if (token) {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 6000);
+            const r = await fetch('https://brapi.dev/api/v2/currency?currency=USD-BRL&token=' + token, { signal: ctrl.signal });
+            clearTimeout(t);
+            const d = await r.json();
+            if (d.currency && d.currency[0]) return d;
+          }
+        } catch(e) { console.warn('[macro] BRAPI currency erro:', e.message); }
+
         return null;
       })(),
 
-      // Selic — BCB série 432
+      // Selic — BRAPI prime-rate (plano pago) com fallback BCB série 432
       (async () => {
+        const token = process.env.BRAPI_TOKEN;
+        if (token) {
+          try {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 6000);
+            const r = await fetch('https://brapi.dev/api/v2/prime-rate?country=brazil&sortBy=date&sortOrder=desc&token=' + token, { signal: ctrl.signal });
+            clearTimeout(t);
+            const d = await r.json();
+            if (d.prime_rate && d.prime_rate[0]) return d;
+          } catch(e) { console.warn('[macro] BRAPI prime-rate erro:', e.message); }
+        }
+        // Fallback BCB
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 6000);
         try {
           const r = await fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json', { signal: ctrl.signal });
           clearTimeout(t);
-          return await r.json();
-        } catch(e) { clearTimeout(t); return null; }
+          const d = await r.json();
+          if (Array.isArray(d) && d[0]) return { prime_rate: [{ value: d[0].valor.replace(',','.') }] };
+        } catch(e) { clearTimeout(t); }
+        return null;
       })(),
 
-      // IPCA 12m — BCB série 13522
+      // IPCA — BRAPI inflation (plano pago) com fallback BCB série 13522
       (async () => {
+        const token = process.env.BRAPI_TOKEN;
+        if (token) {
+          try {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 6000);
+            const r = await fetch('https://brapi.dev/api/v2/inflation?country=brazil&sortBy=date&sortOrder=desc&limit=12&token=' + token, { signal: ctrl.signal });
+            clearTimeout(t);
+            const d = await r.json();
+            if (d.inflation && d.inflation.length) return d;
+          } catch(e) { console.warn('[macro] BRAPI inflation erro:', e.message); }
+        }
+        // Fallback BCB série 13522 (IPCA acum. 12m já calculado)
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 6000);
         try {
           const r = await fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.13522/dados/ultimos/1?formato=json', { signal: ctrl.signal });
           clearTimeout(t);
-          return await r.json();
-        } catch(e) { clearTimeout(t); return null; }
+          const d = await r.json();
+          if (Array.isArray(d) && d[0]) return { inflation: [{ value: d[0].valor.replace(',','.') }], _bcbDirect: true };
+        } catch(e) { clearTimeout(t); }
+        return null;
       })(),
     ]);
 
@@ -84,42 +135,51 @@ router.get('/macro', async (req, res) => {
     const byTk   = {};
     quotes.forEach(function(q){ byTk[q.ticker] = q; });
 
-    // ── USD/BRL via AwesomeAPI ───────────────────────────────────────────────
+    // ── USD/BRL — suporta BRAPI {currency:[{ask}]}, AwesomeAPI {USDBRL:{ask}} e BCB direto
     let usd = null;
-    if (usdRes.status === 'fulfilled') {
+    if (usdRes.status === 'fulfilled' && usdRes.value) {
       try {
         const d = usdRes.value;
-        const row = d.USDBRL || d['USD-BRL'] || Object.values(d)[0];
-        if (row) {
-          usd = parseFloat(row.ask || row.bid || row.high);
+        if (d.currency && d.currency[0]) {
+          // BRAPI: { currency: [{ ask, bidPrice }] }
+          usd = parseFloat(d.currency[0].ask || d.currency[0].bidPrice);
+        } else {
+          // AwesomeAPI: { USDBRL: { ask } } ou BCB wrapped: { USDBRL: { ask } }
+          const row = d.USDBRL || d['USD-BRL'] || Object.values(d)[0];
+          if (row) usd = parseFloat(row.ask || row.bid || row.high);
         }
       } catch(e) { console.warn('[macro] USD parse error:', e.message); }
     } else {
       console.warn('[macro] USD fetch failed:', usdRes.reason?.message);
     }
 
-    // ── Selic via BCB ────────────────────────────────────────────────────────
-    // Série 432 = Taxa Selic (% a.a.)
+    // ── Selic — suporta BRAPI {prime_rate:[{value}]} e BCB wrapped
     let selic = null;
-    if (selicRes.status === 'fulfilled') {
+    if (selicRes.status === 'fulfilled' && selicRes.value) {
       try {
-        const arr = selicRes.value;
-        if (Array.isArray(arr) && arr[0]) {
-          selic = parseFloat(arr[0].valor);
+        const d = selicRes.value;
+        if (d.prime_rate && d.prime_rate[0]) {
+          selic = parseFloat(d.prime_rate[0].value);
         }
       } catch(e) { console.warn('[macro] Selic parse error:', e.message); }
     } else {
       console.warn('[macro] Selic fetch failed:', selicRes.reason?.message);
     }
 
-    // ── IPCA 12m via BCB ─────────────────────────────────────────────────────
-    // Série 13522 = IPCA acumulado 12 meses (já vem calculado pelo BCB)
+    // ── IPCA 12m — suporta BRAPI {inflation:[{value}]} acum. e BCB {_bcbDirect}
     let ipca = null;
-    if (ipcaRes.status === 'fulfilled') {
+    if (ipcaRes.status === 'fulfilled' && ipcaRes.value) {
       try {
-        const arr = ipcaRes.value;
-        if (Array.isArray(arr) && arr[0]) {
-          ipca = parseFloat(parseFloat(arr[0].valor).toFixed(2));
+        const d = ipcaRes.value;
+        if (d.inflation && d.inflation.length) {
+          if (d._bcbDirect) {
+            // BCB série 13522: já vem acumulado
+            ipca = parseFloat(parseFloat(d.inflation[0].value).toFixed(2));
+          } else {
+            // BRAPI: soma os 12 meses
+            ipca = d.inflation.slice(0, 12).reduce((s, x) => s + parseFloat(x.value || 0), 0);
+            ipca = parseFloat(ipca.toFixed(2));
+          }
         }
       } catch(e) { console.warn('[macro] IPCA parse error:', e.message); }
     } else {
