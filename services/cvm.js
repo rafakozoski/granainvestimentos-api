@@ -1,5 +1,6 @@
-// services/cvm.js — Relatórios RI via API pública CVM / ENET
-// Usa a API de consulta do ENET diretamente (mais confiável que o DataStore)
+// services/cvm.js — Relatórios RI via ENET CVM (links diretos, sem CKAN)
+// Estratégia: usa CVM Dados Abertos para buscar CNPJ, depois gera links
+// diretos para o portal ENET que sempre funcionam.
 
 const https = require('https');
 const { get, set } = require('../cache');
@@ -7,183 +8,155 @@ const { get, set } = require('../cache');
 function cleanCnpj(cnpj) {
   return (cnpj || '').replace(/\D/g, '');
 }
-
 function formatCnpj(digits) {
+  if (!digits || digits.length !== 14) return digits;
   return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTTP helper
+// HTTP helper com retry
 // ─────────────────────────────────────────────────────────────────────────────
-function fetchJson(url, options) {
+function fetchJson(url, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { timeout: 12000, ...(options || {}) }, (res) => {
-      // Segue redirecionamentos simples
+    const req = https.get(url, { timeout: timeoutMs || 12000 }, (res) => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-        return fetchJson(res.headers.location, options).then(resolve).catch(reject);
+        return fetchJson(res.headers.location, timeoutMs).then(resolve).catch(reject);
       }
       let raw = '';
       res.on('data', c => { raw += c; });
       res.on('end', () => {
         try { resolve(JSON.parse(raw)); }
-        catch { reject(new Error('JSON inválido (' + res.statusCode + '): ' + url.slice(0, 80))); }
+        catch { reject(new Error('JSON inválido (' + res.statusCode + ')')); }
       });
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout: ' + url.slice(0, 80))); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Busca documentos via CKAN DataStore com CNPJ formatado corretamente
-// A CVM indexa o campo CNPJ_CIA com pontuação: "60.872.504/0001-23"
+// Busca documentos via CVM ENET frmConsultaExternaCVM (scraping leve do JSON)
+// A API de consulta externa retorna JSON quando chamada com Accept: application/json
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchDocsByTipo(cnpjClean, tipo, label, descricao) {
-  const cnpjFmt = formatCnpj(cnpjClean);
+async function fetchEnetDocs(cnpjClean) {
   const docs = [];
-  const anoAtual = new Date().getFullYear();
 
-  for (let ano = anoAtual; ano >= anoAtual - 3; ano--) {
-    // Nome do resource no CKAN (ex: dfp_cia_aberta_2024)
-    // Tenta também o padrão com "con" (consolidado) e sem sufixo
-    const nomes = [
-      `${tipo}_cia_aberta_${ano}`,
-      `${tipo}_cia_aberta_con_${ano}`,
-    ];
+  const TIPOS = [
+    { categ: 'DFP', label: 'DFP', desc: 'Demonstrações Financeiras Anuais' },
+    { categ: 'ITR', label: 'ITR', desc: 'Informações Trimestrais' },
+    { categ: 'FRE', label: 'FRE', desc: 'Formulário de Referência' },
+    { categ: 'IPE', label: 'IPE', desc: 'Fatos Relevantes e Comunicados' },
+  ];
 
-    for (const nome of nomes) {
-      try {
-        // Busca o resource_id pelo nome
-        const pkgUrl = `https://dados.cvm.gov.br/api/3/action/resource_search?query=name:${encodeURIComponent(nome)}&limit=3`;
-        const pkg = await fetchJson(pkgUrl);
-        const resources = pkg?.result?.results || [];
+  // Tenta buscar documentos via API de consulta do ENET
+  // Endpoint: /ENET/frmConsultaExternaCVM.aspx retorna HTML, mas
+  // a API de busca de documentos da CVM retorna JSON
+  const baseEnet = 'https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx';
 
-        for (const resource of resources) {
-          if (!resource.id) continue;
+  await Promise.allSettled(TIPOS.map(async ({ categ, label, desc }) => {
+    try {
+      // A CVM tem uma API JSON interna usada pelo próprio portal
+      const apiUrl = `https://sistemaswebb3-listados.cvm.gov.br/itrDoc/ITRApi/GetDocumentsByCompany`
+        + `?cnpj=${cnpjClean}&categDoc=${categ}&numPag=1&qtdPag=5`;
 
-          // Query com CNPJ formatado (com pontuação)
-          const dsUrl = `https://dados.cvm.gov.br/api/3/action/datastore_search`
-            + `?resource_id=${encodeURIComponent(resource.id)}`
-            + `&filters=${encodeURIComponent(JSON.stringify({ CNPJ_CIA: cnpjFmt }))}`
-            + `&limit=10&sort=DT_REFER%20desc`;
+      const data = await fetchJson(apiUrl, 8000);
 
-          const ds = await fetchJson(dsUrl);
-          const records = ds?.result?.records || [];
-
-          for (const rec of records) {
-            const periodo = rec.DT_REFER || rec.DT_INI_EXERC || rec.DT_RECEB || String(ano);
-
-            // Evita duplicatas
-            const key = `${label}_${periodo}_${rec.VERSAO || '1'}`;
-            if (docs.find(d => d._key === key)) continue;
-
-            let link = rec.LINK_DOC || null;
-            if (!link) {
-              // Monta link ENET com os campos disponíveis
-              if (rec.NUM_SEQ_DOC) {
-                link = `https://www.rad.cvm.gov.br/ENET/frmExibirArquivoIPE.aspx`
-                     + `?NumeroSequencialDocumento=${rec.NUM_SEQ_DOC}`
-                     + `&CodigoTipoDocumento=${rec.COD_TIPO_DOC || ''}`
-                     + `&DataApresentacao=${rec.DT_REFER || ''}`
-                     + `&NumeroSequencialRegistroCvm=${rec.NUM_SEQ_REGST || ''}`
-                     + `&CodigoInstituicao=1`;
-              } else {
-                link = `https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx`
-                     + `?CNPJ=${cnpjClean}&CATEG_DOC=${tipo.toUpperCase()}&ANO=${ano}`;
-              }
-            }
-
-            docs.push({
-              _key:    key,
-              tipo:    label,
-              descricao,
-              empresa: rec.DENOM_CIA || rec.NOME_CIA || '',
-              periodo: periodo.slice(0, 10),
-              versao:  rec.VERSAO || '1',
-              link,
-              ano,
-            });
-          }
-
-          if (docs.filter(d => d.tipo === label && d.ano === ano).length > 0) break;
-        }
-      } catch(e) {
-        // silencia falhas individuais por ano/nome
+      if (data && Array.isArray(data.result)) {
+        data.result.forEach(doc => {
+          docs.push({
+            tipo:      label,
+            descricao: desc,
+            empresa:   doc.nomeCia || doc.empresa || '',
+            periodo:   (doc.dtApresentacao || doc.dtReferencia || '').slice(0, 10),
+            versao:    String(doc.versao || '1'),
+            link:      doc.linkDocumento || `${baseEnet}?CNPJ=${cnpjClean}&CATEG_DOC=${categ}`,
+          });
+        });
       }
-
-      if (docs.filter(d => d.tipo === label && d.ano === ano).length > 0) break;
+    } catch(e) {
+      // silencia — usa links diretos como fallback
     }
-
-    // Se achou docs nesse ano, continua para pegar anos anteriores também (máx 2 anos)
-    if (docs.filter(d => d.tipo === label).length >= 3) break;
-  }
+  }));
 
   return docs;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Links diretos ENET — sempre disponíveis
+// Links diretos ENET — sempre disponíveis independente de qualquer API
 // ─────────────────────────────────────────────────────────────────────────────
 function buildEnetLinks(cnpjClean) {
   const base = `https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx?CNPJ=${cnpjClean}`;
   return [
-    { label: 'Consultar todos os documentos no ENET',  descricao: 'Portal de consulta de documentos da CVM',   link: base },
-    { label: 'DFP — Demonstrações Financeiras Anuais', descricao: 'Balanço patrimonial, DRE, fluxo de caixa',  link: base + '&CATEG_DOC=DFP' },
-    { label: 'ITR — Informações Trimestrais',           descricao: 'Resultados dos últimos trimestres',          link: base + '&CATEG_DOC=ITR' },
-    { label: 'FRE — Formulário de Referência',          descricao: 'Governança, remuneração, fatores de risco',  link: base + '&CATEG_DOC=FRE' },
-    { label: 'IPE — Fatos Relevantes e Comunicados',   descricao: 'Avisos, fatos relevantes, atas de reunião',  link: base + '&CATEG_DOC=IPE' },
+    {
+      label: 'Consultar todos os documentos',
+      descricao: 'Portal ENET — todos os documentos registrados na CVM',
+      link: base,
+    },
+    {
+      label: 'DFP — Demonstrações Financeiras Anuais',
+      descricao: 'Balanço patrimonial, DRE, fluxo de caixa e notas explicativas',
+      link: base + '&CATEG_DOC=DFP',
+    },
+    {
+      label: 'ITR — Informações Trimestrais',
+      descricao: 'Resultados dos últimos trimestres (balanço e DRE)',
+      link: base + '&CATEG_DOC=ITR',
+    },
+    {
+      label: 'FRE — Formulário de Referência',
+      descricao: 'Governança corporativa, remuneração e fatores de risco',
+      link: base + '&CATEG_DOC=FRE',
+    },
+    {
+      label: 'IPE — Fatos Relevantes',
+      descricao: 'Fatos relevantes, comunicados ao mercado e atas',
+      link: base + '&CATEG_DOC=IPE',
+    },
+    {
+      label: 'FCA — Formulário Cadastral',
+      descricao: 'Dados cadastrais, atividades e auditores',
+      link: base + '&CATEG_DOC=FCA',
+    },
   ];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Função principal
+// Função principal exportada
 // ─────────────────────────────────────────────────────────────────────────────
 async function getDocumentsByCnpj(ticker, cnpj) {
   if (!cnpj) return { available: false, reason: 'sem_cnpj', docs: [], enetLinks: [] };
 
   const cnpjClean = cleanCnpj(cnpj);
-  const cacheKey  = `cvm:docs:${cnpjClean}`;
+  if (cnpjClean.length !== 14) {
+    return { available: false, reason: 'cnpj_invalido', cnpj, docs: [], enetLinks: [] };
+  }
 
+  const cacheKey = `cvm:docs:${cnpjClean}`;
   const cached = get(cacheKey);
   if (cached) return cached;
 
   const enetLinks = buildEnetLinks(cnpjClean);
 
-  const TIPOS = [
-    { tipo: 'dfp', label: 'DFP', descricao: 'Demonstrações Financeiras Anuais' },
-    { tipo: 'itr', label: 'ITR', descricao: 'Informações Trimestrais' },
-    { tipo: 'fre', label: 'FRE', descricao: 'Formulário de Referência' },
-    { tipo: 'ipe', label: 'IPE', descricao: 'Fatos Relevantes e Comunicados' },
-  ];
-
-  let allDocs = [];
+  // Tenta buscar docs via API — mas não bloqueia se falhar
+  let docs = [];
   try {
-    const results = await Promise.allSettled(
-      TIPOS.map(({ tipo, label, descricao }) => fetchDocsByTipo(cnpjClean, tipo, label, descricao))
-    );
-    results.forEach(r => {
-      if (r.status === 'fulfilled') allDocs.push(...r.value);
-    });
-
-    // Remove campo interno _key antes de retornar
-    allDocs = allDocs.map(({ _key, ...rest }) => rest);
-    allDocs.sort((a, b) => (b.periodo || '').localeCompare(a.periodo || ''));
+    docs = await fetchEnetDocs(cnpjClean);
   } catch(e) {
-    console.warn('[CVM] Erro geral:', e.message);
+    console.warn('[CVM] fetchEnetDocs falhou:', e.message);
   }
 
   const response = {
     available: true,
     ticker,
-    cnpj,
+    cnpj:      formatCnpj(cnpjClean),
     cnpjClean,
-    docs: allDocs.slice(0, 30),
+    docs:      docs.slice(0, 30),
     enetLinks,
-    updatedAt: new Date().toISOString(),
   };
 
-  set(cacheKey, response, 6 * 60 * 60); // cache 6h
+  // Cache de 6h — docs RI não mudam com frequência
+  set(cacheKey, response, 6 * 60 * 60);
   return response;
 }
 
-module.exports = { getDocumentsByCnpj, cleanCnpj };
+module.exports = { getDocumentsByCnpj };

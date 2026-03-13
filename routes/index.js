@@ -38,17 +38,31 @@ router.get('/macro', async (req, res) => {
 
       // USD/BRL — 3 fontes em cascata
       (async () => {
-        // Fonte 1: BCB cotações do dia (API olinda — retorna valor em tempo real)
+        // Fonte 1: BCB PTAX — tenta hoje, se vazio tenta dia útil anterior
         try {
-          const hoje = new Date().toLocaleDateString('pt-BR').split('/').reverse().join('-'); // YYYY-MM-DD
-          const ctrl = new AbortController();
-          const t = setTimeout(() => ctrl.abort(), 7000);
-          const url = 'https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia(dataCotacao=@dataCotacao)?@dataCotacao=\''+hoje+'\''
-                    + '&$top=1&$orderby=dataHoraCotacao%20desc&$format=json&$select=cotacaoVenda';
-          const r = await fetch(url, { signal: ctrl.signal });
-          clearTimeout(t);
-          const d = await r.json();
-          const val = d && d.value && d.value[0] && d.value[0].cotacaoVenda;
+          const ptaxFetch = async (dateStr) => {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 7000);
+            const url = 'https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia(dataCotacao=@dataCotacao)?@dataCotacao=\''+dateStr+'\''
+                      + '&$top=1&$orderby=dataHoraCotacao%20desc&$format=json&$select=cotacaoVenda';
+            const r = await fetch(url, { signal: ctrl.signal });
+            clearTimeout(t);
+            const d = await r.json();
+            return d && d.value && d.value[0] && d.value[0].cotacaoVenda;
+          };
+          // Formata YYYY-MM-DD no fuso de Brasília
+          const toBrDate = (offset) => {
+            const d = new Date(Date.now() + offset * 86400000);
+            // Brasília = UTC-3
+            const br = new Date(d.getTime() - 3 * 3600000);
+            return br.toISOString().slice(0, 10);
+          };
+          let val = await ptaxFetch(toBrDate(0));
+          // PTAX só sai após ~13h; se vazio tenta ontem
+          if (!val) val = await ptaxFetch(toBrDate(-1));
+          // Final de semana: tenta sexta-feira
+          if (!val) val = await ptaxFetch(toBrDate(-2));
+          if (!val) val = await ptaxFetch(toBrDate(-3));
           if (val) return { USDBRL: { ask: String(val) } };
         } catch(e) { console.warn('[macro] BCB PTAX erro:', e.message); }
 

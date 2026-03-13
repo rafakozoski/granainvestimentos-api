@@ -354,14 +354,32 @@ function normalizeNewsItem(item, sourceFallback) {
   if (!image && item.media?.url) image = item.media.url;
   if (!image && item.thumbnail?.url) image = item.thumbnail.url;
 
-  // 3. Google News embute thumbnail no campo "description" como <img src="...">
-  //    Ex: <img src="https://lh3.googleusercontent.com/..." />
+  // 3. Google News embute thumbnail no campo "description" / content como <img src="...">
+  //    Pode vir com src dentro de aspas simples, duplas ou sem aspas (encoded)
   if (!image) {
-    const rawDesc = item.description || item.content || item['content:encoded'] || item.summary || '';
-    const imgMatch = rawDesc.match(/<img[^>]+src=["']([^"']+)["']/i);
-    if (imgMatch && imgMatch[1] && !imgMatch[1].startsWith('data:')) {
-      image = imgMatch[1];
+    const rawDesc = item.description || item['content:encoded'] || item.content || item.summary || '';
+    // Tenta src com aspas duplas, simples ou entidade &quot;
+    const imgMatch = rawDesc.match(/<img[^>]+src=["\']([^"\'\s>]+)["\']|<img[^>]+src=([^\s>"\'/][^\s>]+)/i);
+    if (imgMatch) {
+      const candidate = imgMatch[1] || imgMatch[2] || '';
+      if (candidate && !candidate.startsWith('data:') && candidate.startsWith('http')) {
+        image = candidate;
+      }
     }
+  }
+
+  // 4. Tenta extrair URL de imagem do link Google News via parâmetro interno
+  //    Google News às vezes embute a imagem como parâmetro na URL do item
+  if (!image && item.link) {
+    const gImgMatch = item.link.match(/imgurl=([^&]+)/);
+    if (gImgMatch) {
+      try { image = decodeURIComponent(gImgMatch[1]); } catch(e) {}
+    }
+  }
+
+  // 5. Campo thumbnail direto (alguns parsers expõem assim)
+  if (!image && item['media:thumbnail'] && typeof item['media:thumbnail'] === 'string') {
+    image = item['media:thumbnail'];
   }
 
   return {
