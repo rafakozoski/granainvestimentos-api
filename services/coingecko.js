@@ -205,12 +205,12 @@ async function getCoinDetail(geckoId) {
 
   var raw = await geckoGet(
     '/coins/' + geckoId +
-    '?localization=false&tickers=false&market_data=false' +
+    '?localization=true&tickers=false&market_data=false' +
     '&community_data=false&developer_data=false&sparkline=false'
   );
 
-  // Strip HTML tags da descrição
-  var desc = (raw.description && raw.description.en) || '';
+  // Strip HTML tags da descrição — prefere PT, cai em EN
+  var desc = (raw.description && (raw.description.pt || raw.description['pt-br'] || raw.description.en)) || '';
   desc = desc.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
   if (desc.length > 1200) desc = desc.slice(0, 1200) + '...';
 
