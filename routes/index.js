@@ -3,6 +3,7 @@
 const express = require('express');
 const router = express.Router();
 const brapi = require('../services/brapi');
+const coingecko = require('../services/coingecko');
 const news = require('../services/news');
 const { getFundamentus, calcPrecoJusto } = require('../services/fundamentus');
 const { FEATURED_TICKERS, searchTickers, findTicker, TICKERS } = require('../data/tickers');
@@ -13,7 +14,22 @@ const { getDocumentsByCnpj } = require('../services/cvm');
 // HEALTH CHECK
 // ─────────────────────────────────────────────
 router.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), cache: stats(), timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    node: process.version,
+    platform: process.platform,
+    env: process.env.NODE_ENV || 'development',
+    port: process.env.PORT || 3000,
+    timestamp: new Date().toISOString(),
+    cache: stats()
+  });
+});
+
+// Middleware de log de requisições simples
+router.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
 });
 
 // ─────────────────────────────────────────────
@@ -484,6 +500,135 @@ router.get('/ri/:ticker', async (req, res) => {
   } catch (err) {
     console.error(`[Route /ri/${ticker}]`, err.message);
     res.status(500).json({ error: 'Erro ao buscar documentos na CVM', ticker });
+  }
+});
+
+// ─────────────────────────────────────────────
+// CRIPTOMOEDAS — CoinGecko
+// ─────────────────────────────────────────────
+
+// GET /api/cripto/markets
+// Retorna dados de mercado em batch de todas as criptos rastreadas
+router.get('/cripto/markets', async (req, res) => {
+  res.set('Cache-Control', 'public, max-age=900');
+  try {
+    const cripto_tickers = Object.keys(coingecko.TICKER_TO_ID);
+    const geckoIds = cripto_tickers.map(t => coingecko.resolveId(t)).filter(Boolean);
+
+    const [marketsResult, globalResult] = await Promise.allSettled([
+      coingecko.getMarkets(geckoIds),
+      coingecko.getGlobal(),
+    ]);
+
+    const coins  = marketsResult.status === 'fulfilled' ? marketsResult.value : null;
+    const global = globalResult.status  === 'fulfilled' ? globalResult.value  : null;
+
+    if (!coins || !coins.length) throw new Error('CoinGecko sem dados');
+
+    return res.json({ coins, global, source: 'coingecko', updatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.warn('[Route /cripto/markets] CoinGecko falhou, usando BRAPI:', err.message);
+    try {
+      const brapiTickers = Object.keys(coingecko.TICKER_TO_ID);
+      const data = await brapi.getQuote(brapiTickers);
+      return res.json({ coins: data, global: null, source: 'brapi', updatedAt: new Date().toISOString() });
+    } catch (err2) {
+      return res.status(502).json({ error: 'Erro ao buscar dados de criptomoedas' });
+    }
+  }
+});
+
+// GET /api/cripto/:ticker/history?days=30
+// Histórico de preços para o gráfico (carregado separadamente)
+router.get('/cripto/:ticker/history', async (req, res) => {
+  const ticker = req.params.ticker.toUpperCase();
+  const days   = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
+  const geckoId = coingecko.resolveId(ticker);
+
+  if (!geckoId) return res.status(404).json({ error: 'Cripto nao encontrada: ' + ticker });
+
+  try {
+    const history = await coingecko.getHistory(geckoId, days);
+    return res.json({ ticker, geckoId, days, history, count: history.length });
+  } catch (err) {
+    console.warn('[Route /cripto/history] CoinGecko falhou, usando BRAPI:', err.message);
+    try {
+      const rangeMap = days <= 7 ? '5d' : days <= 31 ? '1mo' : days <= 182 ? '6mo' : '1y';
+      const history  = await brapi.getHistory(ticker, rangeMap, '1d');
+      // Normaliza formato BRAPI → [{date, close}]
+      const normalized = history.map(function(h) {
+        return { date: String(h.date || h.ajanDate || '').slice(0, 10), close: h.close || h.adjclose || 0 };
+      }).filter(function(h) { return h.date && h.close; });
+      return res.json({ ticker, geckoId, days, history: normalized, count: normalized.length, source: 'brapi' });
+    } catch (err2) {
+      return res.status(502).json({ error: 'Erro ao buscar histórico' });
+    }
+  }
+});
+
+// GET /api/cripto/:ticker
+// Dados completos de uma criptomoeda
+router.get('/cripto/:ticker', async (req, res) => {
+  const ticker  = req.params.ticker.toUpperCase();
+  const geckoId = coingecko.resolveId(ticker);
+
+  if (!geckoId) return res.status(404).json({ error: 'Cripto nao encontrada: ' + ticker, available: false });
+
+  const meta = findTicker(ticker);
+
+  try {
+    const [marketsResult, detailResult, globalResult, newsResult] = await Promise.allSettled([
+      coingecko.getMarkets([geckoId]),
+      coingecko.getCoinDetail(geckoId),
+      coingecko.getGlobal(),
+      news.getNewsByTicker(ticker, 12),
+    ]);
+
+    const market = marketsResult.status === 'fulfilled' && marketsResult.value[0]
+      ? marketsResult.value[0]
+      : null;
+
+    if (!market) throw new Error('Sem dados de mercado para ' + ticker);
+
+    const detail = detailResult.status === 'fulfilled' ? detailResult.value : null;
+    const global = globalResult.status  === 'fulfilled' ? globalResult.value : null;
+    const newsData = newsResult.status  === 'fulfilled' ? newsResult.value   : [];
+
+    return res.json({
+      ticker,
+      geckoId,
+      meta: meta || { code: ticker, name: market.name, type: 'cripto' },
+      market,
+      detail,
+      global,
+      news: newsData,
+      source: 'coingecko',
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn('[Route /cripto/' + ticker + '] CoinGecko falhou, usando BRAPI:', err.message);
+    try {
+      const [quoteResult, newsResult] = await Promise.allSettled([
+        brapi.getOneTicker(ticker),
+        news.getNewsByTicker(ticker, 12),
+      ]);
+      const quote = quoteResult.status === 'fulfilled' ? quoteResult.value : null;
+      if (!quote) return res.status(502).json({ error: 'Dados nao disponíveis para ' + ticker });
+
+      return res.json({
+        ticker,
+        geckoId,
+        meta: meta || { code: ticker, name: quote.name, type: 'cripto' },
+        market: quote,
+        detail: null,
+        global: null,
+        news: newsResult.status === 'fulfilled' ? newsResult.value : [],
+        source: 'brapi',
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err2) {
+      return res.status(502).json({ error: 'Erro ao buscar dados da cripto' });
+    }
   }
 });
 
